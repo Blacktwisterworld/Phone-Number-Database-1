@@ -25,6 +25,9 @@ DB_URL = os.environ.get("DB_URL", "").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip() or None
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
+# Yeh variable automatic set ho jayega
+REMOTE_TABLE = "users" 
+
 db_conn = None 
 
 # Default Credits
@@ -53,7 +56,7 @@ def init_db():
             api_key TEXT PRIMARY KEY, owner_name TEXT, expiry_date TEXT, max_limit INTEGER, 
             used_count INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_date TEXT, 
             rate_limit_seconds INTEGER DEFAULT 1, last_request_time TEXT, allowed_ip TEXT,
-            key_type TEXT DEFAULT 'id', expiry_alert_sent INTEGER DEFAULT 0
+            key_type TEXT DEFAULT 'mobile', expiry_alert_sent INTEGER DEFAULT 0
         )''')
         
         c.execute('''CREATE TABLE IF NOT EXISTS bots (
@@ -113,7 +116,6 @@ async def send_tg_msg_async(bot_token, chat_id, text):
                 json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, 
                 timeout=60.0 
             )
-            print(f"✅ TG SEND [{chat_id}]: {r.status_code}")
     except Exception as e:
         print(f"❌ TG SEND ERROR: {e}")
 
@@ -126,7 +128,6 @@ def send_tg_msg_sync(bot_token, chat_id, text):
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, 
             timeout=60
         )
-        print(f"✅ TG SEND [{chat_id}]: {r.status_code}")
     except Exception as e:
         print(f"❌ TG SEND ERROR: {e}")
 
@@ -160,22 +161,35 @@ async def check_expiry_alerts():
         except Exception as e: print(f"Expiry Task Error: {e}")
 
 # ==========================================
-# 🚀 LIFESPAN (Remote DB Connection)
+# 🚀 LIFESPAN (Remote DB Connection & Auto-Detect Table)
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db_conn
-    print("⏳ Remote Database (50GB) se connect ho raha hai...")
+    global db_conn, REMOTE_TABLE
+    print("⏳ Remote Database se connect ho raha hai...")
     try:
         vfs = HTTPRangeVFS("httpvfs", url=DB_URL, token=HF_TOKEN)
         db_conn = apsw.Connection("remote_db.sqlite", flags=apsw.SQLITE_OPEN_READONLY, vfs="httpvfs")
         
-        # 50GB DB Optimizations
+        # 50GB Optimizations
         db_conn.execute("PRAGMA query_only = ON;")
         db_conn.execute("PRAGMA cache_size = -20000;") 
         db_conn.execute("PRAGMA temp_store = MEMORY;")
+
+        # 🚨 AUTO-DETECT TABLE NAME 🚨
+        try:
+            cursor = db_conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1;")
+            row = cursor.fetchone()
+            if row:
+                REMOTE_TABLE = row[0]
+                print(f"🎯 Auto-detected Table Name: {REMOTE_TABLE}")
+            else:
+                print("⚠️ Koi table nahi mila, default 'users' use ho raha hai.")
+        except Exception as e:
+            print(f"⚠️ Table auto-detect error: {e}")
         
-        print("✅ Remote DB ready!")
+        print(f"✅ Remote DB ready!")
     except Exception as e:
         print(f"❌ Remote DB Error: {e}")
         raise e
@@ -276,8 +290,8 @@ async def telegram_webhook(bot_token: str, request: Request):
         elif key_type == "mobile": search_field = "mobile"
 
         cursor = db_conn.cursor()
-        # Naye Columns: id, mobile, name, fname, address, alt, circle, email
-        query = f"SELECT id, mobile, name, fname, address, alt, circle, email FROM users WHERE {search_field} = ? LIMIT 5"
+        query = f"SELECT id, mobile, name, fname, address, alt, circle, email FROM {REMOTE_TABLE} WHERE {search_field} = ? LIMIT 5"
+        
         try:
             cursor.execute(query, (text,))
             desc = cursor.getdescription()
@@ -525,7 +539,7 @@ async def save_credits(payload: CreditsPayload, admin: dict = Depends(verify_adm
     return {"success": True}
 
 # ==========================================
-# 🖥️ ADMIN HTML
+# 🖥️ ADMIN HTML (No Change)
 # ==========================================
 ADMIN_HTML = """
 <!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Panel</title>
@@ -850,7 +864,7 @@ async def admin_dashboard(admin: dict = Depends(verify_admin)):
     return HTMLResponse(content=ADMIN_HTML)
 
 # ==========================================
-# 🔍 MAIN API ROUTE (Search Logic - Mobile & ID)
+# 🔍 MAIN API ROUTE
 # ==========================================
 @app.get("/search")
 async def search_user_data(key: str = Query(...), id: str = Query(None), mobile: str = Query(None), request: Request = None):
@@ -884,8 +898,7 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), mobile:
         if key_type == "mobile" and (not mobile or id): return JSONResponse({"error": "This Key is restricted to 'mobile' only.", "credits": get_credits("api")}, status_code=400)
 
     cursor = db_conn.cursor()
-    # Naye Columns: id, mobile, name, fname, address, alt, circle, email
-    query = "SELECT id, mobile, name, fname, address, alt, circle, email FROM users WHERE 1=1"
+    query = f"SELECT id, mobile, name, fname, address, alt, circle, email FROM {REMOTE_TABLE} WHERE 1=1"
     params = []
     search_term_for_log = "Unknown"
 
