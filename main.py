@@ -40,19 +40,15 @@ def get_admin_db():
 # 🗄️ ADMIN DATABASE SETUP (Neon PostgreSQL)
 # ==========================================
 def init_db():
-    if not DATABASE_URL: 
-        print("⚠️ DATABASE_URL missing!")
-        return
+    if not DATABASE_URL: return
     try:
         conn = get_admin_db(); c = conn.cursor()
         
-        # Admin Table
         c.execute('''CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY, password TEXT)''')
         c.execute("SELECT count(*) FROM admins")
         if c.fetchone()[0] == 0:
             c.execute("INSERT INTO admins (username, password) VALUES (%s, %s)", ("admin", hash_pass("CyberAdmin123")))
         
-        # API Keys Table
         c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
             api_key TEXT PRIMARY KEY, owner_name TEXT, expiry_date TEXT, max_limit INTEGER, 
             used_count INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_date TEXT, 
@@ -60,22 +56,17 @@ def init_db():
             key_type TEXT DEFAULT 'id', expiry_alert_sent INTEGER DEFAULT 0
         )''')
         
-        # Bots Table
         c.execute('''CREATE TABLE IF NOT EXISTS bots (
             bot_id SERIAL PRIMARY KEY, bot_name TEXT, bot_token TEXT UNIQUE, is_active INTEGER DEFAULT 1, created_at TEXT
         )''')
         
-        # Bot Users Table
-        c.execute("DROP TABLE IF EXISTS bot_users") # Purana schema clean karne ke liye
+        c.execute("DROP TABLE IF EXISTS bot_users") 
         c.execute('''CREATE TABLE IF NOT EXISTS bot_users (
             telegram_id TEXT, bot_token TEXT, api_key TEXT, username TEXT, is_blocked INTEGER DEFAULT 0, joined_date TEXT,
             PRIMARY KEY (telegram_id, bot_token)
         )''')
         
-        # Logs
         c.execute('''CREATE TABLE IF NOT EXISTS search_logs (id SERIAL PRIMARY KEY, api_key TEXT, number TEXT, status TEXT, timestamp TEXT, ip_address TEXT)''')
-        
-        # Settings
         c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
         
         default_credits_json = json.dumps(DEFAULT_CREDITS)
@@ -110,13 +101,12 @@ def get_credits(credit_type="api"):
     return DEFAULT_CREDITS
 
 # ==========================================
-# 🤖 TELEGRAM SEND FUNCTIONS (50GB Optimized Timeout)
+# 🤖 TELEGRAM SEND FUNCTIONS
 # ==========================================
 async def send_tg_msg_async(bot_token, chat_id, text):
     if not bot_token or not chat_id: return
     bot_token = str(bot_token).strip()
     try:
-        # 50GB DB ke liye timeout 60 seconds
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"https://api.telegram.org/bot{bot_token}/sendMessage", 
@@ -145,7 +135,7 @@ def send_tg_msg_sync(bot_token, chat_id, text):
 # ==========================================
 async def check_expiry_alerts():
     while True:
-        await asyncio.sleep(3600) # Har 1 ghante mein check
+        await asyncio.sleep(3600)
         try:
             def task():
                 conn = get_admin_db(); c = conn.cursor()
@@ -170,7 +160,7 @@ async def check_expiry_alerts():
         except Exception as e: print(f"Expiry Task Error: {e}")
 
 # ==========================================
-# 🚀 LIFESPAN (50GB DB Connection)
+# 🚀 LIFESPAN (Remote DB Connection)
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -178,12 +168,11 @@ async def lifespan(app: FastAPI):
     print("⏳ Remote Database (50GB) se connect ho raha hai...")
     try:
         vfs = HTTPRangeVFS("httpvfs", url=DB_URL, token=HF_TOKEN)
-        # VFS connect
         db_conn = apsw.Connection("remote_db.sqlite", flags=apsw.SQLITE_OPEN_READONLY, vfs="httpvfs")
         
-        # 50GB ke liye RAM aur Memory Optimize karna
+        # 50GB DB Optimizations
         db_conn.execute("PRAGMA query_only = ON;")
-        db_conn.execute("PRAGMA cache_size = -20000;") # 20MB SQLite internal cache
+        db_conn.execute("PRAGMA cache_size = -20000;") 
         db_conn.execute("PRAGMA temp_store = MEMORY;")
         
         print("✅ Remote DB ready!")
@@ -230,7 +219,7 @@ async def telegram_webhook(bot_token: str, request: Request):
 
         if text.startswith("/start"):
             if user_row and user_row[1]:
-                await send_tg_msg_async(bot_token, chat_id, f"Welcome back! You are logged in with Key: <code>{user_row[1]}</code>.\n\nSend me an ID, Phone, Username or Email to search.")
+                await send_tg_msg_async(bot_token, chat_id, f"Welcome back! You are logged in with Key: <code>{user_row[1]}</code>.\n\nSend me a <b>Mobile Number</b> or <b>ID</b> to search.")
             else:
                 await send_tg_msg_async(bot_token, chat_id, "Welcome! 🔐 Please send your <b>API Key</b> to login (e.g. HTK-XXXX).")
             c.close(); conn.close()
@@ -279,18 +268,16 @@ async def telegram_webhook(bot_token: str, request: Request):
                 c.close(); conn.close()
                 return {"ok": True}
 
-        search_field = "username"
+        search_field = "mobile"
         if key_type == "universal":
-            if text.isdigit(): search_field = "phone"
-            else: search_field = "username"
+            if text.isdigit(): search_field = "mobile"
+            else: search_field = "id"
         elif key_type == "id": search_field = "id"
-        elif key_type == "phone": search_field = "phone"
-        elif key_type == "username": search_field = "username"
-        elif key_type == "email": search_field = "email"
+        elif key_type == "mobile": search_field = "mobile"
 
-        # 50GB Search Execution
         cursor = db_conn.cursor()
-        query = f"SELECT id, username, email, phone, name, address FROM users WHERE {search_field} = ? LIMIT 5"
+        # Naye Columns: id, mobile, name, fname, address, alt, circle, email
+        query = f"SELECT id, mobile, name, fname, address, alt, circle, email FROM users WHERE {search_field} = ? LIMIT 5"
         try:
             cursor.execute(query, (text,))
             desc = cursor.getdescription()
@@ -313,7 +300,7 @@ async def telegram_webhook(bot_token: str, request: Request):
         if found:
             reply = f"✅ <b>Results for {text}:</b>\n\n"
             for r in results:
-                reply += f"🆔 ID: <code>{r['id']}</code>\n👤 Username: {r['username']}\n📛 Name: {r['name']}\n📞 Phone: <code>{r['phone']}</code>\n📧 Email: {r['email']}\n📍 Address: {r['address']}\n\n"
+                reply += f"🆔 ID: <code>{r['id']}</code>\n📞 Mobile: <code>{r['mobile']}</code>\n📛 Name: {r['name']}\n👨‍👦 Fname: {r['fname']}\n📱 Alt: {r['alt']}\n🌍 Circle: {r['circle']}\n📍 Address: {r['address']}\n📧 Email: {r['email']}\n\n"
             reply += credit_text
         else:
             reply = f"❌ No results found for <b>{text}</b>.\n\n{credit_text}"
@@ -408,7 +395,7 @@ async def get_dashboard_data(admin: dict = Depends(verify_admin)):
     }
 
 @app.post("/api/admin/generate")
-async def generate_key(owner: str = Form(...), days: int = Form(...), limit: int = Form(...), key_type: str = Form("id"), allowed_ip: str = Form(""), admin: dict = Depends(verify_admin)):
+async def generate_key(owner: str = Form(...), days: int = Form(...), limit: int = Form(...), key_type: str = Form("mobile"), allowed_ip: str = Form(""), admin: dict = Depends(verify_admin)):
     new_key = f"HTK-{secrets.token_hex(4).upper()}"
     expiry_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
     created_date = datetime.now().strftime("%Y-%m-%d")
@@ -620,7 +607,13 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
         <article class="card"><div class="card-head"><h2>⌁ Generate New API Key</h2></div>
           <div class="card-body"><form id="keyForm" class="form-grid">
               <div class="field"><label>Owner name</label><input id="owner" placeholder="e.g. John Doe" required></div>
-              <div class="field"><label>Search Type</label><select id="key_type"><option value="id">ID Only</option><option value="phone">Phone Number Only</option><option value="username">Username Only</option><option value="email">Email Only</option><option value="universal" style="color:var(--green); font-weight:bold;">⭐ Universal</option></select></div>
+              <div class="field"><label>Search Type</label>
+                <select id="key_type">
+                    <option value="mobile">Mobile Only (Indexed)</option>
+                    <option value="id">ID Only (Indexed)</option>
+                    <option value="universal" style="color:var(--green); font-weight:bold;">⭐ Universal (Mobile & ID)</option>
+                </select>
+              </div>
               <div class="field"><label>Valid days</label><select id="expiry"><option value="1">1 day</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">365 days</option></select></div>
               <div class="field"><label>Max requests</label><select id="limit"><option value="50">50</option><option value="100" selected>100</option><option value="500">500</option><option value="1000">1,000</option><option value="5000">5,000</option></select></div>
               <div class="field full"><label>Allowed IP (Optional)</label><input id="allowed_ip" placeholder="e.g. 192.168.1.1"></div>
@@ -857,10 +850,10 @@ async def admin_dashboard(admin: dict = Depends(verify_admin)):
     return HTMLResponse(content=ADMIN_HTML)
 
 # ==========================================
-# 🔍 MAIN API ROUTE (Search Logic)
+# 🔍 MAIN API ROUTE (Search Logic - Mobile & ID)
 # ==========================================
 @app.get("/search")
-async def search_user_data(key: str = Query(...), id: str = Query(None), phone: str = Query(None), username: str = Query(None), email: str = Query(None), request: Request = None):
+async def search_user_data(key: str = Query(...), id: str = Query(None), mobile: str = Query(None), request: Request = None):
     if get_setting("maintenance") == "1": return JSONResponse({"error": "Server is under maintenance."}, status_code=503)
 
     client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "Unknown").split(",")[0].strip()
@@ -885,22 +878,19 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), phone: 
             return JSONResponse({"error": f"Rate limit exceeded. Wait {rate_limit}s.", "credits": get_credits("api")}, status_code=429)
 
     if key_type == "universal":
-        if not (id or phone or username or email): return JSONResponse({"error": "Provide at least one search parameter.", "credits": get_credits("api")}, status_code=400)
+        if not (id or mobile): return JSONResponse({"error": "Provide either 'id' or 'mobile' parameter.", "credits": get_credits("api")}, status_code=400)
     else:
-        if key_type == "id" and (not id or phone or username or email): return JSONResponse({"error": "This Key is restricted to 'id' only.", "credits": get_credits("api")}, status_code=400)
-        if key_type == "phone" and (not phone or id or username or email): return JSONResponse({"error": "This Key is restricted to 'phone' only.", "credits": get_credits("api")}, status_code=400)
-        if key_type == "username" and (not username or id or phone or email): return JSONResponse({"error": "This Key is restricted to 'username' only.", "credits": get_credits("api")}, status_code=400)
-        if key_type == "email" and (not email or id or phone or username): return JSONResponse({"error": "This Key is restricted to 'email' only.", "credits": get_credits("api")}, status_code=400)
+        if key_type == "id" and (not id or mobile): return JSONResponse({"error": "This Key is restricted to 'id' only.", "credits": get_credits("api")}, status_code=400)
+        if key_type == "mobile" and (not mobile or id): return JSONResponse({"error": "This Key is restricted to 'mobile' only.", "credits": get_credits("api")}, status_code=400)
 
     cursor = db_conn.cursor()
-    query = "SELECT id, username, email, phone, name, address FROM users WHERE 1=1"
+    # Naye Columns: id, mobile, name, fname, address, alt, circle, email
+    query = "SELECT id, mobile, name, fname, address, alt, circle, email FROM users WHERE 1=1"
     params = []
     search_term_for_log = "Unknown"
 
     if id: query += " AND id = ?"; params.append(str(id).strip()); search_term_for_log = id.strip()
-    if phone: query += " AND phone = ?"; params.append(str(phone).strip()); search_term_for_log = phone.strip()
-    if username: query += " AND username = ?"; params.append(str(username).strip()); search_term_for_log = username.strip()
-    if email: query += " AND email = ?"; params.append(str(email).strip()); search_term_for_log = email.strip()
+    if mobile: query += " AND mobile = ?"; params.append(str(mobile).strip()); search_term_for_log = mobile.strip()
 
     query += " LIMIT 10" 
     start_time = time.time()
