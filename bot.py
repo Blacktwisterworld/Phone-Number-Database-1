@@ -185,7 +185,7 @@ async def handle_webhook(bot_token, data):
     remote_table = get_remote_table()
     db_conn = get_db_conn()
     cursor = db_conn.cursor()
-    query = f"SELECT id, mobile, name, fname, address, alt, circle, email FROM {remote_table} WHERE {search_mode} = ? LIMIT 5"
+    query = f"SELECT id, mobile, name, fname, address, alt, circle, email FROM {remote_table} WHERE {search_mode} = ? LIMIT 10"
 
     try:
         cursor.execute(query, (text,))
