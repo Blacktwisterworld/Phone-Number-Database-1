@@ -517,7 +517,7 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
     <header class="topbar">
       <div style="display:flex;gap:12px;align-items:center">
         <button class="mobile-menu" onclick="document.getElementById('sidebar').classList.toggle('open')">☰</button>
-        <div><h1>Insta Database API</h1><p class="subtitle">Multi-Bot Control System</p></div>
+        <div><h1>PHONE NUMBER DATABASE 1</h1><p class="subtitle">Multi-Bot Control System</p></div>
       </div>
       <div style="display:flex; gap:10px;">
         <a href="/client-portal" target="_blank" class="btn secondary" style="text-decoration:none;">👤 Client Portal</a>
