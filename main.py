@@ -502,7 +502,7 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
 <body>
 <div class="app">
   <aside class="sidebar" id="sidebar">
-    <div class="brand"><div class="logo">ϟ</div><div><strong>Insta DB API</strong><small>SUPERADMIN</small></div></div>
+    <div class="brand"><div class="logo">ϟ</div><div><strong>PHONE NUMBER DB 1</strong><small>SUPERADMIN</small></div></div>
     <nav class="nav">
       <button class="active" onclick="showPage('dashboard', this)">⌂ Dashboard</button>
       <button onclick="showPage('keys', this)">⚿ API Keys</button>
