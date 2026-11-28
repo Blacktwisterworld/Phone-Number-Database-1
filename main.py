@@ -8,6 +8,7 @@ import hashlib
 import requests
 import httpx
 import json
+import traceback
 from fastapi import FastAPI, Request, Form, Depends, HTTPException, status, Query
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -16,21 +17,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Optional
 from vfs import HTTPRangeVFS
+import bot as bot_module
 
 app = FastAPI()
 security = HTTPBasic()
 
-# Environment Variables
 DB_URL = os.environ.get("DB_URL", "").strip()
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip() or None
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
-# Yeh variable automatic set ho jayega
-REMOTE_TABLE = "users" 
+REMOTE_TABLE = "users"
+db_conn = None
 
-db_conn = None 
-
-# Default Credits
 DEFAULT_CREDITS = {"developer": "Cyber_insight_309", "name": "Devid", "telegram": "@cyber_insight_309"}
 
 def hash_pass(pwd):
@@ -40,47 +38,57 @@ def get_admin_db():
     return psycopg2.connect(DATABASE_URL)
 
 # ==========================================
-# 🗄️ ADMIN DATABASE SETUP (Neon PostgreSQL)
+# 🗄️ DATABASE SETUP (With ALTER TABLE fixes)
 # ==========================================
 def init_db():
     if not DATABASE_URL: return
     try:
         conn = get_admin_db(); c = conn.cursor()
-        
+
         c.execute('''CREATE TABLE IF NOT EXISTS admins (username TEXT PRIMARY KEY, password TEXT)''')
         c.execute("SELECT count(*) FROM admins")
         if c.fetchone()[0] == 0:
             c.execute("INSERT INTO admins (username, password) VALUES (%s, %s)", ("admin", hash_pass("CyberAdmin123")))
-        
+        conn.commit()
+
         c.execute('''CREATE TABLE IF NOT EXISTS api_keys (
-            api_key TEXT PRIMARY KEY, owner_name TEXT, expiry_date TEXT, max_limit INTEGER, 
-            used_count INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_date TEXT, 
+            api_key TEXT PRIMARY KEY, owner_name TEXT, expiry_date TEXT, max_limit INTEGER,
+            used_count INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, created_date TEXT,
             rate_limit_seconds INTEGER DEFAULT 1, last_request_time TEXT, allowed_ip TEXT,
             key_type TEXT DEFAULT 'mobile', expiry_alert_sent INTEGER DEFAULT 0
         )''')
-        
+        # ALTER for existing tables missing columns
+        c.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_type TEXT DEFAULT 'mobile'")
+        c.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expiry_alert_sent INTEGER DEFAULT 0")
+        conn.commit()
+
         c.execute('''CREATE TABLE IF NOT EXISTS bots (
             bot_id SERIAL PRIMARY KEY, bot_name TEXT, bot_token TEXT UNIQUE, is_active INTEGER DEFAULT 1, created_at TEXT
         )''')
-        
-        c.execute("DROP TABLE IF EXISTS bot_users") 
+        conn.commit()
+
         c.execute('''CREATE TABLE IF NOT EXISTS bot_users (
             telegram_id TEXT, bot_token TEXT, api_key TEXT, username TEXT, is_blocked INTEGER DEFAULT 0, joined_date TEXT,
             PRIMARY KEY (telegram_id, bot_token)
         )''')
-        
+        c.execute("ALTER TABLE bot_users ADD COLUMN IF NOT EXISTS search_mode TEXT DEFAULT NULL")
+        conn.commit()
+
         c.execute('''CREATE TABLE IF NOT EXISTS search_logs (id SERIAL PRIMARY KEY, api_key TEXT, number TEXT, status TEXT, timestamp TEXT, ip_address TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
-        
+        conn.commit()
+
         default_credits_json = json.dumps(DEFAULT_CREDITS)
-        for k, v in [("maintenance", "0"), ("global_rate_limit", "1"), ("admin_chat_id", ""), 
+        for k, v in [("maintenance", "0"), ("global_rate_limit", "1"), ("admin_chat_id", ""),
                      ("api_credits", default_credits_json), ("bot_credits", default_credits_json)]:
             c.execute(f"INSERT INTO settings (key, value) VALUES ('{k}', '{v}') ON CONFLICT (key) DO NOTHING")
-        
-        conn.commit(); c.close(); conn.close()
+        conn.commit()
+
+        c.close(); conn.close()
         print("✅ Admin DB Initialized Successfully!")
     except Exception as e:
         print(f"❌ DB Init Error: {e}")
+        traceback.print_exc()
 
 init_db()
 
@@ -104,7 +112,7 @@ def get_credits(credit_type="api"):
     return DEFAULT_CREDITS
 
 # ==========================================
-# 🤖 TELEGRAM SEND FUNCTIONS
+# 🤖 TELEGRAM SEND HELPERS
 # ==========================================
 async def send_tg_msg_async(bot_token, chat_id, text):
     if not bot_token or not chat_id: return
@@ -112,10 +120,11 @@ async def send_tg_msg_async(bot_token, chat_id, text):
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
-                f"https://api.telegram.org/bot{bot_token}/sendMessage", 
-                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, 
-                timeout=60.0 
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=60.0
             )
+            print(f"✅ TG SEND [{chat_id}]: {r.status_code}")
     except Exception as e:
         print(f"❌ TG SEND ERROR: {e}")
 
@@ -124,15 +133,15 @@ def send_tg_msg_sync(bot_token, chat_id, text):
     bot_token = str(bot_token).strip()
     try:
         r = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage", 
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, 
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
             timeout=60
         )
     except Exception as e:
         print(f"❌ TG SEND ERROR: {e}")
 
 # ==========================================
-# 🕒 BACKGROUND TASK (Expiry Alerts)
+# 🕒 EXPIRY ALERTS
 # ==========================================
 async def check_expiry_alerts():
     while True:
@@ -151,9 +160,8 @@ async def check_expiry_alerts():
                     if admin_chat and admin_bot:
                         send_tg_msg_sync(admin_bot[0], admin_chat, f"⚠️ <b>Key Expiring Soon!</b>\n\nClient: {owner}\nKey: <code>{key}</code>\nExpiry: {exp}")
                     c.execute("SELECT telegram_id, bot_token FROM bot_users WHERE api_key = %s", (key,))
-                    bot_users = c.fetchall()
-                    for user in bot_users:
-                        send_tg_msg_sync(user[1], user[0], f"⚠️ <b>Your API Key is expiring in 3 days!</b>\n\nKey: <code>{key}</code>\nExpiry: {exp}\n\nPlease contact admin to renew.")
+                    for user in c.fetchall():
+                        send_tg_msg_sync(user[1], user[0], f"⚠️ <b>Your API Key is expiring in 3 days!</b>\n\nKey: <code>{key}</code>\nExpiry: {exp}")
                     c.execute("UPDATE api_keys SET expiry_alert_sent = 1 WHERE api_key = %s", (key,))
                     conn.commit()
                 c.close(); conn.close()
@@ -161,7 +169,7 @@ async def check_expiry_alerts():
         except Exception as e: print(f"Expiry Task Error: {e}")
 
 # ==========================================
-# 🚀 LIFESPAN (Remote DB Connection & Auto-Detect Table)
+# 🚀 LIFESPAN
 # ==========================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -170,13 +178,10 @@ async def lifespan(app: FastAPI):
     try:
         vfs = HTTPRangeVFS("httpvfs", url=DB_URL, token=HF_TOKEN)
         db_conn = apsw.Connection("remote_db.sqlite", flags=apsw.SQLITE_OPEN_READONLY, vfs="httpvfs")
-        
-        # 50GB Optimizations
         db_conn.execute("PRAGMA query_only = ON;")
-        db_conn.execute("PRAGMA cache_size = -20000;") 
+        db_conn.execute("PRAGMA cache_size = -20000;")
         db_conn.execute("PRAGMA temp_store = MEMORY;")
 
-        # 🚨 AUTO-DETECT TABLE NAME 🚨
         try:
             cursor = db_conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1;")
@@ -184,16 +189,25 @@ async def lifespan(app: FastAPI):
             if row:
                 REMOTE_TABLE = row[0]
                 print(f"🎯 Auto-detected Table Name: {REMOTE_TABLE}")
-            else:
-                print("⚠️ Koi table nahi mila, default 'users' use ho raha hai.")
         except Exception as e:
             print(f"⚠️ Table auto-detect error: {e}")
-        
-        print(f"✅ Remote DB ready!")
+
+        print("✅ Remote DB ready!")
     except Exception as e:
         print(f"❌ Remote DB Error: {e}")
         raise e
-    
+
+    # Initialize bot module with callbacks
+    bot_module.init_bot(
+        get_admin_db=get_admin_db,
+        get_db_conn=lambda: db_conn,
+        get_setting=get_setting,
+        get_credits=get_credits,
+        send_tg_msg_async=send_tg_msg_async,
+        get_remote_table=lambda: REMOTE_TABLE
+    )
+    print("✅ Bot Module Initialized!")
+
     alert_task = asyncio.create_task(check_expiry_alerts())
     yield
     alert_task.cancel()
@@ -202,132 +216,18 @@ async def lifespan(app: FastAPI):
 app.router.lifespan_context = lifespan
 
 # ==========================================
-# 🤖 MULTI-BOT WEBHOOK
+# 🤖 WEBHOOK -> bot.py
 # ==========================================
 @app.post("/webhook/{bot_token}")
 async def telegram_webhook(bot_token: str, request: Request):
-    bot_token = bot_token.strip()
-    
-    conn = get_admin_db(); c = conn.cursor()
-    c.execute("SELECT is_active FROM bots WHERE bot_token = %s", (bot_token,))
-    bot_row = c.fetchone()
-    if not bot_row or bot_row[0] == 0:
-        c.close(); conn.close()
-        return {"status": "bot disabled"}
-    
     try:
         data = await request.json()
-        if "message" not in data or "text" not in data["message"]: return {"ok": True}
-        
-        chat_id = str(data["message"]["chat"]["id"])
-        text = data["message"]["text"].strip()
-        tg_username = data["message"]["from"].get("username", "Unknown")
-        
-        c.execute("SELECT is_blocked, api_key FROM bot_users WHERE telegram_id = %s AND bot_token = %s", (chat_id, bot_token))
-        user_row = c.fetchone()
-        
-        if user_row and user_row[0] == 1:
-            await send_tg_msg_async(bot_token, chat_id, "🚫 You are blocked by Admin.")
-            c.close(); conn.close()
-            return {"ok": True}
-
-        if text.startswith("/start"):
-            if user_row and user_row[1]:
-                await send_tg_msg_async(bot_token, chat_id, f"Welcome back! You are logged in with Key: <code>{user_row[1]}</code>.\n\nSend me a <b>Mobile Number</b> or <b>ID</b> to search.")
-            else:
-                await send_tg_msg_async(bot_token, chat_id, "Welcome! 🔐 Please send your <b>API Key</b> to login (e.g. HTK-XXXX).")
-            c.close(); conn.close()
-            return {"ok": True}
-
-        # LOGIN FLOW
-        if not user_row or not user_row[1]:
-            c.execute("SELECT api_key, expiry_date, is_active, key_type FROM api_keys WHERE api_key = %s", (text,))
-            api_row = c.fetchone()
-            if api_row:
-                if api_row[2] == 0 or datetime.strptime(api_row[1], "%Y-%m-%d").date() < datetime.now().date():
-                    await send_tg_msg_async(bot_token, chat_id, "❌ This API Key is expired or blocked.")
-                else:
-                    c.execute("""INSERT INTO bot_users (telegram_id, bot_token, api_key, username, joined_date) 
-                                 VALUES (%s, %s, %s, %s, %s) 
-                                 ON CONFLICT (telegram_id, bot_token) DO UPDATE SET api_key = EXCLUDED.api_key, is_blocked = 0""", 
-                              (chat_id, bot_token, text, tg_username, datetime.now().strftime("%Y-%m-%d")))
-                    conn.commit()
-                    await send_tg_msg_async(bot_token, chat_id, f"✅ Login Successful!\nKey Type: <b>{api_row[3].upper()}</b>.\n\nNow send me a search query.")
-            else:
-                await send_tg_msg_async(bot_token, chat_id, "❌ Invalid API Key. Please check and send again.")
-            c.close(); conn.close()
-            return {"ok": True}
-
-        # SEARCH FLOW
-        api_key = user_row[1]
-        c.execute("SELECT expiry_date, max_limit, used_count, is_active, rate_limit_seconds, last_request_time, key_type FROM api_keys WHERE api_key = %s", (api_key,))
-        api_data = c.fetchone()
-        
-        if not api_data or api_data[3] == 0 or datetime.strptime(api_data[0], "%Y-%m-%d").date() < datetime.now().date():
-            await send_tg_msg_async(bot_token, chat_id, "❌ Your API Key is expired or blocked.")
-            c.close(); conn.close()
-            return {"ok": True}
-
-        expiry, max_limit, used_count, is_active, rate_limit, last_req_str, key_type = api_data
-
-        if used_count >= max_limit:
-            await send_tg_msg_async(bot_token, chat_id, "❌ API Limit Exceeded. Please contact admin.")
-            c.close(); conn.close()
-            return {"ok": True}
-            
-        if last_req_str:
-            last_req_time = datetime.strptime(last_req_str, "%Y-%m-%d %H:%M:%S")
-            if (datetime.now() - last_req_time).total_seconds() < rate_limit:
-                await send_tg_msg_async(bot_token, chat_id, f"⏳ Rate limit exceeded. Please wait {rate_limit} seconds.")
-                c.close(); conn.close()
-                return {"ok": True}
-
-        search_field = "mobile"
-        if key_type == "universal":
-            if text.isdigit(): search_field = "mobile"
-            else: search_field = "id"
-        elif key_type == "id": search_field = "id"
-        elif key_type == "mobile": search_field = "mobile"
-
-        cursor = db_conn.cursor()
-        query = f"SELECT id, mobile, name, fname, address, alt, circle, email FROM {REMOTE_TABLE} WHERE {search_field} = ? LIMIT 5"
-        
-        try:
-            cursor.execute(query, (text,))
-            desc = cursor.getdescription()
-            results = [{col[0]: r[i] for i, col in enumerate(desc)} for r in cursor]
-        except Exception as e:
-            await send_tg_msg_async(bot_token, chat_id, f"❌ Database Error: {e}")
-            c.close(); conn.close()
-            return {"ok": True}
-
-        found = len(results) > 0
-        status_str = "Found" if found else "Not Found"
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("UPDATE api_keys SET used_count = used_count + 1, last_request_time = %s WHERE api_key = %s", (now_str, api_key))
-        c.execute("INSERT INTO search_logs (api_key, number, status, timestamp, ip_address) VALUES (%s, %s, %s, %s, %s)", (api_key, text, status_str, now_str, f"TG-{chat_id}"))
-        conn.commit()
-        
-        b_credits = get_credits("bot")
-        credit_text = f"━━━━━━━━━━━━━━━\n🤖 <b>Credits:</b>\n👨‍💻 Developer: {b_credits.get('developer', 'N/A')}\n👤 Name: {b_credits.get('name', 'N/A')}\n📱 Telegram: {b_credits.get('telegram', 'N/A')}"
-
-        if found:
-            reply = f"✅ <b>Results for {text}:</b>\n\n"
-            for r in results:
-                reply += f"🆔 ID: <code>{r['id']}</code>\n📞 Mobile: <code>{r['mobile']}</code>\n📛 Name: {r['name']}\n👨‍👦 Fname: {r['fname']}\n📱 Alt: {r['alt']}\n🌍 Circle: {r['circle']}\n📍 Address: {r['address']}\n📧 Email: {r['email']}\n\n"
-            reply += credit_text
-        else:
-            reply = f"❌ No results found for <b>{text}</b>.\n\n{credit_text}"
-
-        await send_tg_msg_async(bot_token, chat_id, reply)
-        c.close(); conn.close()
-        
-    except Exception as e:
-        print(f"Webhook Error: {e}")
-    return {"ok": True}
+    except:
+        return {"ok": True}
+    return await bot_module.handle_webhook(bot_token, data)
 
 # ==========================================
-# 🔐 AUTHENTICATION
+# 🔐 AUTH
 # ==========================================
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
     conn = get_admin_db(); c = conn.cursor()
@@ -339,7 +239,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
     return {"username": credentials.username}
 
 # ==========================================
-# 🌐 PUBLIC STATUS & CLIENT PORTAL
+# 🌐 STATUS & CLIENT PORTAL
 # ==========================================
 @app.get("/status", response_class=HTMLResponse)
 async def status_page():
@@ -375,7 +275,7 @@ async def get_dashboard_data(admin: dict = Depends(verify_admin)):
     logs_rows = c.fetchall()
     c.execute("SELECT * FROM bots ORDER BY bot_id DESC")
     bots_rows = c.fetchall()
-    c.execute("SELECT * FROM bot_users ORDER BY joined_date DESC")
+    c.execute("SELECT telegram_id, bot_token, api_key, username, is_blocked, joined_date FROM bot_users ORDER BY joined_date DESC")
     bot_users_rows = c.fetchall()
     c.execute("SELECT timestamp FROM search_logs")
     all_logs = c.fetchall()
@@ -410,15 +310,22 @@ async def get_dashboard_data(admin: dict = Depends(verify_admin)):
 
 @app.post("/api/admin/generate")
 async def generate_key(owner: str = Form(...), days: int = Form(...), limit: int = Form(...), key_type: str = Form("mobile"), allowed_ip: str = Form(""), admin: dict = Depends(verify_admin)):
-    new_key = f"HTK-{secrets.token_hex(4).upper()}"
-    expiry_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-    created_date = datetime.now().strftime("%Y-%m-%d")
-    rate_limit = int(get_setting("global_rate_limit") or 1)
-    clean_ip = allowed_ip.strip() if allowed_ip.strip() else None
-    conn = get_admin_db(); c = conn.cursor()
-    c.execute("INSERT INTO api_keys (api_key, owner_name, expiry_date, max_limit, created_date, rate_limit_seconds, allowed_ip, key_type) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", (new_key, owner, expiry_date, limit, created_date, rate_limit, clean_ip, key_type))
-    conn.commit(); c.close(); conn.close()
-    return {"success": True, "key": new_key}
+    try:
+        new_key = f"HTK-{secrets.token_hex(4).upper()}"
+        expiry_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+        created_date = datetime.now().strftime("%Y-%m-%d")
+        rate_limit = int(get_setting("global_rate_limit") or 1)
+        clean_ip = allowed_ip.strip() if allowed_ip.strip() else None
+        conn = get_admin_db(); c = conn.cursor()
+        c.execute("INSERT INTO api_keys (api_key, owner_name, expiry_date, max_limit, created_date, rate_limit_seconds, allowed_ip, key_type) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", (new_key, owner, expiry_date, limit, created_date, rate_limit, clean_ip, key_type))
+        conn.commit()
+        c.close(); conn.close()
+        print(f"✅ Key generated & saved: {new_key}")
+        return {"success": True, "key": new_key}
+    except Exception as e:
+        print(f"❌ KEY SAVE ERROR: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 class ActionPayload(BaseModel):
     key: str
@@ -478,7 +385,7 @@ class BotActionPayload(BaseModel):
 async def bot_action(payload: BotActionPayload, admin: dict = Depends(verify_admin)):
     conn = get_admin_db(); c = conn.cursor()
     if payload.action == "toggle": c.execute("UPDATE bots SET is_active = 1 - is_active WHERE bot_token = %s", (payload.token,))
-    elif payload.action == "delete": 
+    elif payload.action == "delete":
         c.execute("DELETE FROM bots WHERE bot_token = %s", (payload.token,))
         c.execute("DELETE FROM bot_users WHERE bot_token = %s", (payload.token,))
     conn.commit(); c.close(); conn.close()
@@ -494,7 +401,7 @@ async def bot_user_action(payload: UserActionPayload, admin: dict = Depends(veri
     conn = get_admin_db(); c = conn.cursor()
     if payload.action == "block": c.execute("UPDATE bot_users SET is_blocked = 1 WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
     elif payload.action == "unblock": c.execute("UPDATE bot_users SET is_blocked = 0 WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
-    elif payload.action == "remove_key": c.execute("UPDATE bot_users SET api_key = NULL WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
+    elif payload.action == "remove_key": c.execute("UPDATE bot_users SET api_key = NULL, search_mode = NULL WHERE telegram_id = %s AND bot_token = %s", (payload.tg_id, payload.bot_token))
     conn.commit(); c.close(); conn.close()
     return {"success": True}
 
@@ -539,10 +446,11 @@ async def save_credits(payload: CreditsPayload, admin: dict = Depends(verify_adm
     return {"success": True}
 
 # ==========================================
-# 🖥️ ADMIN HTML (No Change)
+# 🖥️ ADMIN HTML (Same as before - copy from previous)
 # ==========================================
-ADMIN_HTML = """
-<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Panel</title>
+# NOTE: Isme koi change nahi hai, pichla ADMIN_HTML as-is paste karo
+ADMIN_HTML = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Panel</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <style>
 :root{--bg:#02080b;--panel:#061318;--line:#0a4949;--green:#00ffad;--cyan:#00e5ff;--text:#e2faff;--muted:#86aebc;--red:#ff477e;--radius:16px;}
@@ -623,9 +531,9 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
               <div class="field"><label>Owner name</label><input id="owner" placeholder="e.g. John Doe" required></div>
               <div class="field"><label>Search Type</label>
                 <select id="key_type">
-                    <option value="mobile">Mobile Only (Indexed)</option>
-                    <option value="id">ID Only (Indexed)</option>
-                    <option value="universal" style="color:var(--green); font-weight:bold;">⭐ Universal (Mobile & ID)</option>
+                    <option value="mobile">Mobile Only</option>
+                    <option value="id">ID Only</option>
+                    <option value="universal" style="color:var(--green); font-weight:bold;">⭐ Universal</option>
                 </select>
               </div>
               <div class="field"><label>Valid days</label><select id="expiry"><option value="1">1 day</option><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option><option value="365">365 days</option></select></div>
@@ -753,32 +661,21 @@ h1{font-size:24px;margin:0}.subtitle{color:var(--muted);font-size:14px}
 let keys = [], logs = [], bots = [], bot_users = [], currentSettings = {}, chartInstance = null;
 let selectedBotForBC = null, selectedUserForDM = null;
 const $ = id => document.getElementById(id);
-function showPage(pageId, btn) { 
-    document.querySelectorAll('.page-section').forEach(p => p.classList.remove('active')); 
-    $('page-' + pageId).classList.add('active'); 
-    if(btn) { document.querySelectorAll('.nav button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); } 
-    if(pageId === 'settings') loadSettingsUI(); 
+function showPage(pageId, btn) {
+    document.querySelectorAll('.page-section').forEach(p => p.classList.remove('active'));
+    $('page-' + pageId).classList.add('active');
+    if(btn) { document.querySelectorAll('.nav button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); }
+    if(pageId === 'settings') loadSettingsUI();
     if(pageId === 'credits') loadCreditsUI();
-    if(window.innerWidth <= 900) $('sidebar').classList.remove('open'); 
+    if(window.innerWidth <= 900) $('sidebar').classList.remove('open');
 }
 function toast(message){ const t=$("toast"); t.textContent=message; t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),3200); }
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-
 function loadSettingsUI() { $("setMaintenance").checked = currentSettings.maintenance === "1"; $("setRateLimit").value = currentSettings.global_rate_limit || "1"; $("setAdminChatId").value = currentSettings.admin_chat_id || ""; }
-
 function loadCreditsUI() {
-    if(currentSettings.api_credits) {
-        $("apiDev").value = currentSettings.api_credits.developer || "";
-        $("apiName").value = currentSettings.api_credits.name || "";
-        $("apiTg").value = currentSettings.api_credits.telegram || "";
-    }
-    if(currentSettings.bot_credits) {
-        $("botDev").value = currentSettings.bot_credits.developer || "";
-        $("botNameInp").value = currentSettings.bot_credits.name || "";
-        $("botTg").value = currentSettings.bot_credits.telegram || "";
-    }
+    if(currentSettings.api_credits) { $("apiDev").value = currentSettings.api_credits.developer || ""; $("apiName").value = currentSettings.api_credits.name || ""; $("apiTg").value = currentSettings.api_credits.telegram || ""; }
+    if(currentSettings.bot_credits) { $("botDev").value = currentSettings.bot_credits.developer || ""; $("botNameInp").value = currentSettings.bot_credits.name || ""; $("botTg").value = currentSettings.bot_credits.telegram || ""; }
 }
-
 function updateStats(stats){ $("totalStat").textContent = stats.total; $("activeStat").textContent = stats.active; $("blockedStat").textContent = stats.blocked; $("requestStat").textContent = stats.requests.toLocaleString(); }
 function renderChart(data) { if(chartInstance) chartInstance.destroy(); const ctx = document.getElementById('usageChart').getContext('2d'); chartInstance = new Chart(ctx, { type: 'line', data: { labels: ['6d','5d','4d','3d','2d','1d','Today'], datasets: [{ data: data, borderColor: '#00ffad', backgroundColor: 'rgba(0, 255, 173, 0.1)', borderWidth: 2, fill: true, tension: 0.4 }] }, options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true }, x: { grid: { display: false } } } } }); }
 function renderKeys(){
@@ -799,7 +696,6 @@ function editKey(key, currentLimit, currentExpiry, currentIp) {
 }
 function deleteKey(key) { if(confirm("Permanently delete this API key?")) { performAction(key, "delete"); $("keyDetails").innerHTML = 'Select a key.'; } }
 async function performAction(key, action, value=null) { try { const res = await fetch('/api/admin/action', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({key, action, value}) }); if(res.ok) { toast("Success!"); await loadData(); } } catch(e) {} }
-
 function renderBots() {
     $("botList").innerHTML = bots.map(b => `
         <div class="key-row" style="grid-template-columns: 1fr auto; padding: 10px; border-bottom: 1px solid #10363d;">
@@ -826,7 +722,6 @@ async function sendBroadcast() { const msg = $("bcMsg").value.trim(); if(!msg) r
 function openDM(tg_id, bot_token, username) { selectedUserForDM = { tg_id, bot_token }; $("dmUser").textContent = "@" + username; $("dmMsg").value = ""; $("dmModal").style.display = "flex"; }
 async function sendDirectMsg() { const msg = $("dmMsg").value.trim(); if(!msg) return toast("Message khali hai!"); toast("Sending..."); const res = await fetch('/api/admin/send_message', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({bot_token: selectedUserForDM.bot_token, tg_id: selectedUserForDM.tg_id, message: msg}) }); if(res.ok) { toast("Sent!"); closeModal(); } }
 function closeModal() { $("broadcastModal").style.display = "none"; $("dmModal").style.display = "none"; }
-
 async function loadData() {
     try {
         const res = await fetch('/api/admin/dashboard'); const data = await res.json();
@@ -838,33 +733,29 @@ async function loadData() {
     } catch(e) { toast("Error loading data"); }
 }
 $("addBotForm").addEventListener("submit", async (e)=>{ e.preventDefault(); const payload = { name: $("botName").value, token: $("botToken").value }; const res = await fetch('/api/admin/add_bot', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); if(res.ok) { const r = await res.json(); if(r.success) { toast("Bot Added & Webhook Set!"); $("botName").value=""; $("botToken").value=""; await loadData(); } else { toast("Error: Invalid Token or Duplicate"); } } });
-$("keyForm").addEventListener("submit", async (e)=>{ e.preventDefault(); const fd = new FormData(); fd.append("owner", $("owner").value); fd.append("key_type", $("key_type").value); fd.append("days", $("expiry").value); fd.append("limit", $("limit").value); fd.append("allowed_ip", $("allowed_ip").value); const res = await fetch('/api/admin/generate', { method: 'POST', body: fd }); if(res.ok) { const r = await res.json(); toast("Key: " + r.key); await loadData(); } });
+$("keyForm").addEventListener("submit", async (e)=>{ e.preventDefault(); const fd = new FormData(); fd.append("owner", $("owner").value); fd.append("key_type", $("key_type").value); fd.append("days", $("expiry").value); fd.append("limit", $("limit").value); fd.append("allowed_ip", $("allowed_ip").value); const res = await fetch('/api/admin/generate', { method: 'POST', body: fd }); if(res.ok) { const r = await res.json(); toast("Key: " + r.key); await loadData(); } else { const err = await res.json(); toast("Error: " + (err.detail || "Unknown")); } });
 $("settingsForm").addEventListener("submit", async (e) => { e.preventDefault(); const payload = { maintenance: $("setMaintenance").checked ? "1" : "0", global_rate_limit: $("setRateLimit").value, admin_chat_id: $("setAdminChatId").value }; await fetch('/api/admin/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); toast("Saved!"); await loadData(); });
-
-// Save Credits Forms
-$("apiCreditsForm").addEventListener("submit", async (e) => { 
-    e.preventDefault(); 
-    const payload = { type: "api", developer: $("apiDev").value, name: $("apiName").value, telegram: $("apiTg").value }; 
-    const res = await fetch('/api/admin/save_credits', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); 
-    if(res.ok) { toast("API Credits Saved!"); await loadData(); } 
+$("apiCreditsForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const payload = { type: "api", developer: $("apiDev").value, name: $("apiName").value, telegram: $("apiTg").value };
+    const res = await fetch('/api/admin/save_credits', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    if(res.ok) { toast("API Credits Saved!"); await loadData(); }
 });
-$("botCreditsForm").addEventListener("submit", async (e) => { 
-    e.preventDefault(); 
-    const payload = { type: "bot", developer: $("botDev").value, name: $("botNameInp").value, telegram: $("botTg").value }; 
-    const res = await fetch('/api/admin/save_credits', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) }); 
-    if(res.ok) { toast("Bot Credits Saved!"); await loadData(); } 
+$("botCreditsForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const payload = { type: "bot", developer: $("botDev").value, name: $("botNameInp").value, telegram: $("botTg").value };
+    const res = await fetch('/api/admin/save_credits', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+    if(res.ok) { toast("Bot Credits Saved!"); await loadData(); }
 });
-
 $("searchInput").addEventListener("input",renderKeys); loadData();
-</script></body></html>
-"""
+</script></body></html>"""
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_dashboard(admin: dict = Depends(verify_admin)):
     return HTMLResponse(content=ADMIN_HTML)
 
 # ==========================================
-# 🔍 MAIN API ROUTE
+# 🔍 SEARCH API
 # ==========================================
 @app.get("/search")
 async def search_user_data(key: str = Query(...), id: str = Query(None), mobile: str = Query(None), request: Request = None):
@@ -892,7 +783,7 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), mobile:
             return JSONResponse({"error": f"Rate limit exceeded. Wait {rate_limit}s.", "credits": get_credits("api")}, status_code=429)
 
     if key_type == "universal":
-        if not (id or mobile): return JSONResponse({"error": "Provide either 'id' or 'mobile' parameter.", "credits": get_credits("api")}, status_code=400)
+        if not (id or mobile): return JSONResponse({"error": "Provide either 'id' or 'mobile'.", "credits": get_credits("api")}, status_code=400)
     else:
         if key_type == "id" and (not id or mobile): return JSONResponse({"error": "This Key is restricted to 'id' only.", "credits": get_credits("api")}, status_code=400)
         if key_type == "mobile" and (not mobile or id): return JSONResponse({"error": "This Key is restricted to 'mobile' only.", "credits": get_credits("api")}, status_code=400)
@@ -905,7 +796,7 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), mobile:
     if id: query += " AND id = ?"; params.append(str(id).strip()); search_term_for_log = id.strip()
     if mobile: query += " AND mobile = ?"; params.append(str(mobile).strip()); search_term_for_log = mobile.strip()
 
-    query += " LIMIT 10" 
+    query += " LIMIT 10"
     start_time = time.time()
     try:
         cursor.execute(query, params)
@@ -922,14 +813,14 @@ async def search_user_data(key: str = Query(...), id: str = Query(None), mobile:
     c.execute("UPDATE api_keys SET used_count = used_count + 1, last_request_time = %s WHERE api_key = %s", (now_str, key))
     c.execute("INSERT INTO search_logs (api_key, number, status, timestamp, ip_address) VALUES (%s, %s, %s, %s, %s)", (key, search_term_for_log, status_str, now_str, client_ip))
     conn.commit()
-    
+
     if used_count + 1 >= int(max_limit * 0.9) and used_count < int(max_limit * 0.9):
         admin_chat = get_setting("admin_chat_id")
         c.execute("SELECT bot_token FROM bots WHERE is_active = 1 LIMIT 1")
         admin_bot = c.fetchone()
         if admin_chat and admin_bot:
             await send_tg_msg_async(admin_bot[0], admin_chat, f"⚠️ <b>API Limit Alert (90%)!</b>\n\nKey: <code>{key}</code>\nUsed: {used_count + 1}/{max_limit}")
-        
+
     c.close(); conn.close()
     return JSONResponse({"status": "Success" if found else "Not Found", "time_taken_ms": search_time, "credits": get_credits("api"), "total_results": len(results), "data": results})
 
