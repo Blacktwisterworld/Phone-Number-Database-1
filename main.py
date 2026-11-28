@@ -38,7 +38,7 @@ def get_admin_db():
     return psycopg2.connect(DATABASE_URL)
 
 # ==========================================
-# 🗄️ DATABASE SETUP (With ALTER TABLE fixes)
+# 🗄️ DATABASE SETUP
 # ==========================================
 def init_db():
     if not DATABASE_URL: return
@@ -57,7 +57,6 @@ def init_db():
             rate_limit_seconds INTEGER DEFAULT 1, last_request_time TEXT, allowed_ip TEXT,
             key_type TEXT DEFAULT 'mobile', expiry_alert_sent INTEGER DEFAULT 0
         )''')
-        # ALTER for existing tables missing columns
         c.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_type TEXT DEFAULT 'mobile'")
         c.execute("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expiry_alert_sent INTEGER DEFAULT 0")
         conn.commit()
@@ -197,7 +196,6 @@ async def lifespan(app: FastAPI):
         print(f"❌ Remote DB Error: {e}")
         raise e
 
-    # Initialize bot module with callbacks
     bot_module.init_bot(
         get_admin_db=get_admin_db,
         get_db_conn=lambda: db_conn,
@@ -359,6 +357,7 @@ class BotPayload(BaseModel):
     name: str
     token: str
 
+# 🔥 YAHAN FIX KYA HAI (AUTOMATIC WEBHOOK SET HOGI AB)
 @app.post("/api/admin/add_bot")
 async def add_bot(payload: BotPayload, request: Request, admin: dict = Depends(verify_admin)):
     token = payload.token.strip()
@@ -367,10 +366,22 @@ async def add_bot(payload: BotPayload, request: Request, admin: dict = Depends(v
     try:
         c.execute("INSERT INTO bots (bot_name, bot_token, created_at) VALUES (%s, %s, %s)", (name, token, datetime.now().strftime("%Y-%m-%d")))
         conn.commit()
-        base_url = str(request.base_url).rstrip("/")
+        
+        # Force HTTPS for Render
+        base_url = str(request.base_url).rstrip("/").replace("http://", "https://")
         webhook_url = f"{base_url}/webhook/{token}"
-        requests.get(f"https://api.telegram.org/bot{token}/setWebhook?url={webhook_url}")
-        success = True
+        
+        # Telegram se response check kar rahe hain
+        res = requests.get(f"https://api.telegram.org/bot{token}/setWebhook?url={webhook_url}")
+        res_data = res.json()
+        
+        if res_data.get("ok"):
+            print(f"✅ Webhook set for {name}: {webhook_url}")
+            success = True
+        else:
+            print(f"❌ Telegram rejected webhook: {res_data}")
+            success = False
+            
     except Exception as e:
         print(f"Add Bot Error: {e}")
         success = False
@@ -446,9 +457,8 @@ async def save_credits(payload: CreditsPayload, admin: dict = Depends(verify_adm
     return {"success": True}
 
 # ==========================================
-# 🖥️ ADMIN HTML (Same as before - copy from previous)
+# 🖥️ ADMIN HTML
 # ==========================================
-# NOTE: Isme koi change nahi hai, pichla ADMIN_HTML as-is paste karo
 ADMIN_HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Admin Panel</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
